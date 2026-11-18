@@ -44,7 +44,8 @@ class Settings:
     llm_think: bool = field(default_factory=lambda: _bool("LLM_THINK", True))
     llm_cpu_only: bool = field(default_factory=lambda: _bool("LLM_CPU_ONLY", True))
     llm_threads: int = field(default_factory=lambda: _int("LLM_THREADS", 4))  # 0 = let Ollama decide
-    llm_ctx: int = field(default_factory=lambda: _int("LLM_CTX", 8192))
+    # A web question piles up search results and pages over several rounds: 8192 overflows
+    llm_ctx: int = field(default_factory=lambda: _int("LLM_CTX", 16384))
     llm_max_rounds: int = field(default_factory=lambda: _int("LLM_MAX_ROUNDS", 5))
     history_turns: int = field(default_factory=lambda: _int("HISTORY_TURNS", 4))
     history_ttl_s: int = field(default_factory=lambda: _int("HISTORY_TTL_S", 300))

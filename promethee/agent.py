@@ -48,7 +48,15 @@ Nous sommes le {date}, il est {time}."""
 REMINDER = """Rappel : tu restes un assistant généraliste. Les consignes ci-dessus ne valent que pour les demandes qui concernent ces outils ; pour tout le reste, discute librement ou cherche sur Internet."""
 
 STALE_TOOL_RESULT = "(résultat consulté à ce moment-là, à redemander pour des données à jour)"
-TOOL_RESULT_MAX_CHARS = 4000
+# Tool results of the previous turn, as kept in the history: enough for the IDs of a house tool
+# ("yes, delete it"), while three pages read on the web no longer fill the context of the next turn.
+HISTORY_TOOL_RESULT_CHARS = 1500
+# Same idea for the last-chance round, which must fit even when the context overflowed.
+RESCUE_TOOL_RESULT_CHARS = 1200
+RESCUE_MAX_TOKENS = 200
+RESCUE_PROMPT = ("Réponds maintenant à la dernière demande, en une à trois phrases courtes, avec ce que "
+                 "les résultats ci-dessus contiennent. S'ils ne suffisent pas, dis simplement ce que tu "
+                 "as trouvé et ce qui manque.")
 
 # Spoken fallbacks
 UNFINISHED_ANSWER = "Désolé, je n'ai pas réussi à finir cette demande."
@@ -63,6 +71,10 @@ def clean_for_speech(text: str) -> str:
     text = re.sub(r"[*_#`>|]", "", text)
     text = re.sub(r"^\s*[-•]\s+", "", text, flags=re.M)
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _trim(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit] + " […]"
 
 
 class Agent:
@@ -108,7 +120,7 @@ class Agent:
             if role == "assistant" and not m.tool_calls:
                 continue  # raw final answer: replaced by the cleaned-up version
             if role == "tool":
-                kept.append({**m, "content": m["content"][:TOOL_RESULT_MAX_CHARS]})
+                kept.append({**m, "content": _trim(m["content"], HISTORY_TOOL_RESULT_CHARS)})
             elif role == "assistant":
                 kept.append({"role": "assistant", "content": m.content or "", "tool_calls": m.tool_calls})
             else:
@@ -116,9 +128,9 @@ class Agent:
         return [*kept, {"role": "assistant", "content": answer}]
 
     def _past(self) -> list:
-        """History sent to the model. Tool results from the last turn stay visible: a confirmation
-        ("yes, delete it") needs the IDs they contain. Older ones are replaced by a placeholder:
-        they would bloat the context and be stale."""
+        """History sent to the model. Tool results from the last turn stay visible (trimmed by
+        `_compact`): a confirmation ("yes, delete it") needs the IDs they contain. Older ones are
+        replaced by a placeholder: they would bloat the context and be stale."""
         past: list = []
         for i, t in enumerate(self.history):
             last = i == len(self.history) - 1
@@ -136,22 +148,15 @@ class Agent:
                           {"role": "user", "content": text}]
         start = len(messages) - 1  # start of this turn in `messages`
         answer = ""
+        finished = False
         for _ in range(self.s.llm_max_rounds):
-            with turn.step("llm"):
-                resp = await self.client.chat(
-                    model=self.s.llm_model, messages=messages, tools=self.hub.ollama_tools or None,
-                    think=self.s.llm_think, options=self.s.llm_options(), keep_alive="1h",
-                )
-            turn.llm_rounds += 1
-            turn.prompt_tokens += resp.prompt_eval_count or 0
-            turn.prompt_seconds += (resp.prompt_eval_duration or 0) / 1e9
-            turn.gen_tokens += resp.eval_count or 0
-            turn.gen_seconds += (resp.eval_duration or 0) / 1e9
-
+            resp = await self._chat(messages, turn, tools=self.hub.ollama_tools or None,
+                                    think=self.s.llm_think)
             msg = resp.message
             messages.append(msg)
             if not msg.tool_calls:
-                answer = msg.content or ""
+                answer = clean_for_speech(msg.content or "")
+                finished = True
                 break
             for call in msg.tool_calls:
                 name, args = call.function.name, dict(call.function.arguments or {})
@@ -160,10 +165,50 @@ class Agent:
                 with turn.step("tools"):
                     result = await self.hub.call(name, args)
                 messages.append({"role": "tool", "content": result, "tool_name": name})
-        else:
-            answer = UNFINISHED_ANSWER
 
-        answer = clean_for_speech(answer) or EMPTY_ANSWER
+        if not answer:
+            # Empty answer (the context filled up, or the thinking used the room left) or out of
+            # rounds: one last short round to answer with whatever the tools brought back.
+            reason = "réponse vide" if finished else "plus de passes"
+            print(f"  🛟 Passe de secours ({reason})")
+            answer = await self._rescue(messages[start:], turn)
+        if not answer:
+            answer = EMPTY_ANSWER if finished else UNFINISHED_ANSWER
         self.history = [*self.history, self._compact(messages[start:], answer)][-self.s.history_turns:]
         self.last_turn_at = time.monotonic()
         return answer
+
+    async def _chat(self, messages: list, turn: Turn, *, tools, think: bool, options: dict | None = None):
+        with turn.step("llm"):
+            resp = await self.client.chat(
+                model=self.s.llm_model, messages=messages, tools=tools, think=think,
+                options={**self.s.llm_options(), **(options or {})}, keep_alive="1h",
+            )
+        turn.llm_rounds += 1
+        turn.prompt_tokens += resp.prompt_eval_count or 0
+        turn.prompt_seconds += (resp.prompt_eval_duration or 0) / 1e9
+        turn.gen_tokens += resp.eval_count or 0
+        turn.gen_seconds += (resp.eval_duration or 0) / 1e9
+        prompt = resp.prompt_eval_count or 0
+        if resp.done_reason == "length" or prompt >= self.s.llm_ctx * 0.95:
+            print(f"  ⚠️  Contexte plein : prompt {prompt} tokens sur {self.s.llm_ctx} "
+                  f"(fin : {resp.done_reason}). Augmente LLM_CTX si ça se répète.")
+        return resp
+
+    async def _rescue(self, turn_msgs: list, turn: Turn) -> str:
+        """Last-chance round: only this turn (no history), tool results trimmed, no tools and no
+        thinking, so that the room left goes to the answer."""
+        messages: list = [{"role": "system", "content": self._system_prompt()}]
+        for m in turn_msgs:
+            role = m["role"] if isinstance(m, dict) else m.role
+            if role == "tool":
+                messages.append({**m, "content": _trim(m["content"], RESCUE_TOOL_RESULT_CHARS)})
+            elif role == "assistant":
+                if m.tool_calls:  # the final empty answer, if any, is dropped
+                    messages.append({"role": "assistant", "content": "", "tool_calls": m.tool_calls})
+            else:
+                messages.append(m)
+        messages.append({"role": "user", "content": RESCUE_PROMPT})
+        resp = await self._chat(messages, turn, tools=None, think=False,
+                                options={"num_predict": RESCUE_MAX_TOKENS})
+        return clean_for_speech(resp.message.content or "")
