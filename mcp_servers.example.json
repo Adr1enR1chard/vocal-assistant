@@ -1,0 +1,9 @@
+{
+  "servers": {
+    "stockpot": {
+      "type": "http",
+      "url": "https://stockpot.YOUR-SUBDOMAIN.workers.dev/mcp",
+      "oauth": true
+    }
+  }
+}
