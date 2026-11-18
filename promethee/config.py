@@ -68,9 +68,15 @@ class Settings:
     # Wake word (openWakeWord): "Prométhée", a custom model to train (see README)
     wake_word: str = field(default_factory=lambda: _wake_word(_env("WAKE_WORD", "models/promethee.onnx")))
     wake_threshold: float = field(default_factory=lambda: _float("WAKE_THRESHOLD", 0.5))
+    # Audio kept from just before the detection, for a question chained right after the wake word
+    wake_preroll_s: float = field(default_factory=lambda: _float("WAKE_PREROLL_S", 0.25))
+    # After an answer, listen this long for a follow-up without the wake word (0 = off)
+    follow_up_s: float = field(default_factory=lambda: _float("FOLLOW_UP_S", 10))
 
     # Recording
     silence_s: float = field(default_factory=lambda: _float("SILENCE_S", 0.8))
+    # Voiced time needed before it counts as speech (ignores clicks and the wake word's tail)
+    min_speech_s: float = field(default_factory=lambda: _float("MIN_SPEECH_S", 0.25))
     max_utterance_s: float = field(default_factory=lambda: _float("MAX_UTTERANCE_S", 15))
     no_speech_timeout_s: float = field(default_factory=lambda: _float("NO_SPEECH_TIMEOUT_S", 5))
     input_device: str | None = field(default_factory=lambda: os.environ.get("INPUT_DEVICE") or None)

@@ -92,7 +92,8 @@ async def cmd_chat(s: Settings, speak: bool) -> None:
 
 async def cmd_run(s: Settings, ptt: bool) -> None:
     from .agent import Agent
-    from .audio import Microphone, SpeechToText, TextToSpeech, WakeWord, record_utterance
+    from .audio import (Microphone, SpeechToText, TextToSpeech, WakeWord, record_utterance,
+                        strip_wake_word)
     from .mcp_hub import McpHub
 
     print("🧩 Loading audio models…")
@@ -104,26 +105,45 @@ async def cmd_run(s: Settings, ptt: bool) -> None:
         print(f"🧠 Loading {s.llm_model}…")
         await agent.warmup()
         with Microphone(s) as mic:
+            # "wake": wait for the wake word. "follow_up": the assistant just answered, listen a
+            # while without the wake word. "awake": only the wake word was heard, listen again.
+            state = "wake"
             while True:
+                preroll = None
+                timeout = s.no_speech_timeout_s
                 if ptt:
                     await in_thread(input, "\n⏎  Press Enter, then speak…")
                     mic.flush()
+                elif state == "follow_up":
+                    await asyncio.sleep(0.2)  # let the speaker's echo die out
+                    mic.flush()
+                    timeout = s.follow_up_s
+                    print(f"\n👂 Still listening for {s.follow_up_s:g}s…")
+                elif state == "awake":
+                    print("👂 Listening.")
                 else:
                     print(f'\n👂 Listening for "{s.wake_word_label}"…')
-                    score = await in_thread(wake.wait, mic)
+                    score, preroll = await in_thread(wake.wait, mic)
                     print(f"✨ Woken up (score {score:.2f}), listening.")
+                state = "wake"
 
                 turn = Turn()
                 turn.sampler.start()
                 t_start = time.perf_counter()
                 with turn.step("record"):
-                    audio = await in_thread(record_utterance, mic, s)
+                    audio = await in_thread(record_utterance, mic, s, timeout, preroll)
                 if audio is None:
                     turn.sampler.stop()
                     print("🤷 Heard nothing.")
                     continue
                 with turn.step("stt"):
                     turn.heard = await in_thread(stt.transcribe, audio)
+                if wake:
+                    turn.heard, had_wake_word = strip_wake_word(turn.heard, s.wake_word_label)
+                    if had_wake_word and not turn.heard:
+                        turn.sampler.stop()
+                        state = "awake"
+                        continue
                 print(f"🗣  {turn.heard!r}")
                 if not turn.heard:
                     turn.sampler.stop()
@@ -131,6 +151,8 @@ async def cmd_run(s: Settings, ptt: bool) -> None:
                 turn.answer = await agent.ask(turn.heard, turn)
                 print(f"🤖 {turn.answer}")
                 await in_thread(tts.speak, turn.answer, turn)
+                if wake and s.follow_up_s > 0:
+                    state = "follow_up"
                 turn.times["total"] = time.perf_counter() - t_start
                 turn.sampler.stop()
                 print(turn.summary())

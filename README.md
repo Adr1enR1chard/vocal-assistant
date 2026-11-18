@@ -83,6 +83,8 @@ The wake word is "Prométhée". openWakeWord only ships English models, so it ne
 3. Train, download the `.onnx` file and save it as `models/promethee.onnx` (the default `WAKE_WORD`).
 4. Tune `WAKE_THRESHOLD` if it triggers too often (raise it) or misses you (lower it).
 
+You can chain the question without a pause ("Prométhée, quel temps fait-il ?"): the recording starts with the audio heard just before the detection (`WAKE_PREROLL_S`), and the wake word is removed from the transcription. After each answer, the assistant keeps listening for `FOLLOW_UP_S` seconds (10 by default) so you can reply without saying the wake word again; past that, it goes back to waiting for it.
+
 Until the model exists, `promethee run --ptt` works without a wake word, or set `WAKE_WORD=hey_jarvis` to use a built-in model.
 
 ## On the box (Linux)
